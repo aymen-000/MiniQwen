@@ -87,6 +87,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None):
         cos = cos.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, dim)
         sin = sin.unsqueeze(0).unsqueeze(0)
     else:
+        position_ids = position_ids.long()
         cos = cos[position_ids].unsqueeze(1)
         sin = sin[position_ids].unsqueeze(1)
     

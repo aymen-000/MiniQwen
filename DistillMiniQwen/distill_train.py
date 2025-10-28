@@ -32,7 +32,7 @@ def parse_args():
     parser.add_argument('--rms_norm_eps', type=float, default=1e-6,
                         help='RMSNorm epsilon')
     parser.add_argument('--tie_word_embeddings', action='store_true',
-                        help='Tie input/output embeddings')
+                        help='Tie input/output embeddings' , default=True)
     parser.add_argument('--head_dim', type=int, default=None,
                         help='Head dimension (optional)')
     
@@ -113,6 +113,8 @@ def parse_args():
                         help='Random seed')
     parser.add_argument('--fp16_teacher', action='store_true', default=True,
                         help='Use FP16 for teacher model')
+    parser.add_argument('--debug', action='store_true',
+                        help='Enable debug mode with extra checks')
     
     return parser.parse_args()
 
@@ -134,7 +136,7 @@ def main():
     # Load teacher model
     print(f"Loading teacher model: {args.teacher_model}")
     teacher_tokenizer = AutoTokenizer.from_pretrained(args.teacher_model, trust_remote_code=True)
-    
+    print(f"teacher tokenizer {len(teacher_tokenizer)} ")
     teacher_kwargs = {'trust_remote_code': True}
     if args.fp16_teacher and device == 'cuda':
         teacher_kwargs['torch_dtype'] = torch.float16
@@ -148,7 +150,6 @@ def main():
     # Add pad token if not present
     if teacher_tokenizer.pad_token is None:
         teacher_tokenizer.pad_token = teacher_tokenizer.eos_token
-    
     # Student config
     config = Qwen3Config(
         n_embed=args.n_embed,
@@ -173,6 +174,23 @@ def main():
     total_params = sum(p.numel() for p in student_model.parameters())
     trainable_params = sum(p.numel() for p in student_model.parameters() if p.requires_grad)
     print(f"Student model - Total params: {total_params:,}, Trainable: {trainable_params:,}")
+    
+    # CRITICAL: Verify model output dimension matches vocab size
+    print("\nVerifying model configuration...")
+    test_input = torch.randint(0, len(teacher_tokenizer), (1, 10)).to(device)
+    with torch.no_grad():
+        test_output = student_model(test_input)
+    print(f"Model output shape: {test_output.shape}")
+    print(f"Expected vocab size: {len(teacher_tokenizer)}")
+    print(f"Model config vocab_size: {config.vocab_size}")
+    
+    if test_output.shape[-1] != len(teacher_tokenizer):
+        raise ValueError(
+            f"MODEL OUTPUT MISMATCH!\n"
+            f"Model outputs {test_output.shape[-1]} logits but tokenizer has {len(teacher_tokenizer)} tokens.\n"
+            f"Check your model's lm_head or embedding layer."
+        )
+    print("✓ Model output dimension verification passed")
     
     # Optimizer
     optimizer = torch.optim.AdamW(
@@ -243,11 +261,27 @@ def main():
         num_workers=args.num_workers
     )
     
+    # Validate dataset
+    print("\nValidating dataset...")
+    test_batch = next(iter(loader))
+    test_ids = test_batch["input_ids"]
+    max_id = test_ids.max().item()
+    min_id = test_ids.min().item()
+    print(f"Token ID range: [{min_id}, {max_id}]")
+    print(f"Tokenizer vocab size: {len(teacher_tokenizer)}")
+    
+    if max_id >= len(teacher_tokenizer):
+        raise ValueError(
+            f"Dataset contains token IDs ({max_id}) >= vocab size ({len(teacher_tokenizer)}). "
+            f"Check your preprocessing."
+        )
+    print("✓ Dataset validation passed")
+    
     # ===========================
     # 3. DISTILLATION LOOP
     # ===========================
     kl_loss_fn = nn.KLDivLoss(reduction="batchmean")
-    ce_loss_fn = nn.CrossEntropyLoss(ignore_index=teacher_tokenizer.pad_token_id)
+    ce_loss_fn = nn.CrossEntropyLoss()
     
     print("\n" + "="*50)
     print("Starting distillation training...")
@@ -269,6 +303,12 @@ def main():
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             
+            # Verify input_ids are valid
+            if input_ids.max() >= len(teacher_tokenizer):
+                print(f"\nWarning: Found invalid token ID {input_ids.max().item()} in batch {batch_idx}")
+                print(f"Valid range is [0, {len(teacher_tokenizer)-1}]")
+                continue
+            
             # Create labels (shift input_ids by 1 for causal LM)
             labels = input_ids.clone()
             labels[:, :-1] = input_ids[:, 1:]
@@ -277,18 +317,38 @@ def main():
             # Mask padding tokens in labels
             labels[labels == teacher_tokenizer.pad_token_id] = -100
             
+            # Additional safety: ensure no labels are out of bounds
+            valid_mask = (labels >= 0) & (labels < len(teacher_tokenizer))
+            labels[~valid_mask & (labels != -100)] = -100
+            
             # Get teacher predictions (no gradient)
             with torch.no_grad():
                 teacher_outputs = teacher_model(
                     input_ids,
                     attention_mask=attention_mask
                 )
-                teacher_logits = teacher_outputs.logits / args.temperature
-                teacher_probs = torch.softmax(teacher_logits, dim=-1)
+                teacher_logits = teacher_outputs.logits[: , : , :len(teacher_tokenizer)]  # (B, T, vocab_size)
+                
+                # Debug: Check teacher output shape on first batch
+                if batch_idx == 0 and epoch == 0:
+                    print(f"\nTeacher output shapes:")
+                    print(f"  teacher_logits: {teacher_logits.shape}")
+                    print(f"  Expected: (batch={input_ids.shape[0]}, seq={input_ids.shape[1]}, vocab={len(teacher_tokenizer)})")
+                
+                teacher_logits_temp = teacher_logits / args.temperature
+                teacher_probs = torch.softmax(teacher_logits_temp, dim=-1)
             
             # Get student predictions
             try:
-                student_logits = student_model(input_ids)
+                student_logits = student_model(input_ids)  # (B, T, vocab_size)
+                
+                # Debug: Check shapes on first batch
+                if batch_idx == 0 and epoch == 0:
+                    print(f"\nStudent output shapes:")
+                    print(f"  student_logits: {student_logits.shape}")
+                    print(f"  labels: {labels.shape}")
+                    print(f"  Expected student: (batch={input_ids.shape[0]}, seq={input_ids.shape[1]}, vocab={len(teacher_tokenizer)})")
+                    
             except Exception as e:
                 print(f"\nError in student forward pass: {e}")
                 print(f"Input shape: {input_ids.shape}")
@@ -296,20 +356,57 @@ def main():
             
             # Apply temperature to student logits
             student_logits_temp = student_logits / args.temperature
-            student_log_probs = torch.log_softmax(student_logits_temp, dim=-1)
+            student_log_probs = torch.log_softmax(student_logits_temp, dim=-1)  # (B, T, vocab_size)
+            
+            # Verify shapes match
+            if batch_idx == 0 and epoch == 0:
+                print(f"\nBefore loss computation:")
+                print(f"  student_log_probs: {student_log_probs.shape}")
+                print(f"  teacher_probs: {teacher_probs.shape}")
+                print(f"  Flattened student logits: {student_logits.view(-1, student_logits.size(-1)).shape}")
+                print(f"  Flattened labels: {labels.view(-1).shape}")
+            # Verify shapes are compatible
+            assert student_logits.shape == teacher_logits.shape, \
+                f"Shape mismatch: student {student_logits.shape} vs teacher {teacher_logits.shape}"
             
             # Cross entropy loss (student vs. ground truth)
             ce_loss = ce_loss_fn(
-                student_logits.view(-1, student_logits.size(-1)),
-                labels.view(-1)
+                student_logits.view(-1, student_logits.size(-1)),  # (B*T, vocab_size)
+                labels.view(-1)  # (B*T,)
             )
             
             # KL divergence (student vs. teacher)
-            mask = (labels != -100).unsqueeze(-1).expand_as(student_log_probs)
-            masked_student_log_probs = student_log_probs * mask.float()
-            masked_teacher_probs = teacher_probs * mask.float()
+            # Both should be (B, T, vocab_size)
+            B, T, V = student_log_probs.shape
             
-            kd_loss = kl_loss_fn(masked_student_log_probs, masked_teacher_probs)
+            # Create mask for valid (non-padding) tokens
+            mask = (labels != -100).float()  # (B, T)
+            
+            # Compute KL divergence per token, then average over valid tokens
+            # KL(P||Q) = sum(P * (log(P) - log(Q)))
+            # For numerical stability, use the log_softmax output
+            kl_per_token = torch.sum(
+                teacher_probs * (torch.log(teacher_probs + 1e-10) - student_log_probs),
+                dim=-1
+            )  # (B, T)
+            
+            # Apply mask and compute mean over valid tokens
+            masked_kl = kl_per_token * mask
+            num_valid_tokens = mask.sum()
+            
+            if num_valid_tokens > 0:
+                kd_loss = masked_kl.sum() / num_valid_tokens
+            else:
+                kd_loss = torch.tensor(0.0, device=device)
+            
+            if batch_idx == 0 and epoch == 0:
+                print(f"\nLoss computation:")
+                print(f"  CE loss: {ce_loss.item():.4f}")
+                print(f"  KD loss: {kd_loss.item():.4f}")
+                print(f"  Valid tokens: {num_valid_tokens.item()}")
+                print(f"  Temperature: {args.temperature}")
+                print(f"  Temperature^2: {args.temperature ** 2}")
+
             
             # Combined loss
             loss = args.alpha_ce * ce_loss + args.alpha_kd * (args.temperature ** 2) * kd_loss
@@ -360,7 +457,7 @@ def main():
                     checkpoint['scheduler_state_dict'] = scheduler.state_dict()
                 
                 torch.save(checkpoint, checkpoint_path)
-                print(f"\nCheckpoint saved to {checkpoint_path}")
+                print(f"\n Checkpoint saved to {checkpoint_path}")
         
         # Epoch summary
         avg_loss = total_loss / len(loader)
@@ -390,7 +487,7 @@ def main():
                 checkpoint['scheduler_state_dict'] = scheduler.state_dict()
             
             torch.save(checkpoint, best_model_path)
-            print(f"Best model saved to {best_model_path}")
+            print(f" Best model saved to {best_model_path}")
     
     # ===========================
     # 4. SAVE FINAL MODEL
@@ -431,49 +528,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-    
-"""     
-# Small model for testing
-python distill_qwen3_moe.py \
-    --n_embed 256 \
-    --n_head 4 \
-    --n_kv_heads 2 \
-    --n_layer 4 \
-    --num_experts 4 \
-    --num_experts_per_tok 2 \
-    --batch_size 8 \
-    --num_epochs 5 \
-    --max_samples 5000
-
-# Larger model with different teacher
-python distill_qwen3_moe.py \
-    --teacher_model Qwen/Qwen2.5-1.5B \
-    --n_embed 768 \
-    --n_head 12 \
-    --n_kv_heads 4 \
-    --n_layer 12 \
-    --num_experts 16 \
-    --num_experts_per_tok 4 \
-    --batch_size 4 \
-    --learning_rate 5e-5 \
-    --max_samples 20000
-
-# Adjust distillation parameters
-python distill_qwen3_moe.py \
-    --alpha_ce 0.3 \
-    --alpha_kd 0.7 \
-    --temperature 3.0 \
-    --scheduler_type linear
-
-# Different dataset
-python distill_qwen3_moe.py \
-    --dataset "your-username/your-dataset" \
-    --instruction_column "prompt" \
-    --output_column "completion" \
-    --max_length 512
-
-# Save checkpoints more frequently
-python distill_qwen3_moe.py \
-    --save_interval 50 \
-    --output_dir ./my_checkpoints \
-    --best_model_name my_best_model.pt """
