@@ -6,6 +6,8 @@ from datasets import load_dataset
 from tqdm import tqdm
 import os
 import argparse
+import csv
+from datetime import datetime
 from DistillMiniQwen.model import Qwen3MoE, Qwen3Config
 
 
@@ -97,6 +99,10 @@ def parse_args():
     parser.add_argument('--final_model_name', type=str, default='qwen3_moe_distilled_final.pt',
                         help='Final model checkpoint name')
     
+    # Logging
+    parser.add_argument('--log_file', type=str, default='training_logs.csv',
+                        help='CSV file to save training logs')
+    
     # Testing
     parser.add_argument('--test_prompt', type=str, 
                         default='Instruction: List all files in the current directory\nAnswer:',
@@ -126,6 +132,17 @@ def main():
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
+    
+    # Initialize CSV logging
+    log_file = args.log_file
+    csv_headers = ['timestamp', 'epoch', 'step', 'total_loss', 'ce_loss', 'kd_loss', 'learning_rate']
+    
+    # Create log file with headers
+    with open(log_file, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(csv_headers)
+    
+    print(f"Training logs will be saved to: {log_file}")
     
     # ===========================
     # 1. CONFIGURATION
@@ -372,44 +389,24 @@ def main():
             # Cross entropy loss (student vs. ground truth)
             ce_loss = ce_loss_fn(
                 student_logits.view(-1, student_logits.size(-1)),  # (B*T, vocab_size)
-                labels.view(-1)  # (B*T,)
+                labels.view(-1)    # (B*T,vocab_size)
             )
             
-            # KL divergence (student vs. teacher)
-            # Both should be (B, T, vocab_size)
-            B, T, V = student_log_probs.shape
+
             
-            # Create mask for valid (non-padding) tokens
-            mask = (labels != -100).float()  # (B, T)
-            
-            # Compute KL divergence per token, then average over valid tokens
-            # KL(P||Q) = sum(P * (log(P) - log(Q)))
-            # For numerical stability, use the log_softmax output
-            kl_per_token = torch.sum(
-                teacher_probs * (torch.log(teacher_probs + 1e-10) - student_log_probs),
-                dim=-1
-            )  # (B, T)
-            
-            # Apply mask and compute mean over valid tokens
-            masked_kl = kl_per_token * mask
-            num_valid_tokens = mask.sum()
-            
-            if num_valid_tokens > 0:
-                kd_loss = masked_kl.sum() / num_valid_tokens
-            else:
-                kd_loss = torch.tensor(0.0, device=device)
+            # Compute KL divergence 
+            kd_loss = kl_loss_fn(student_log_probs, teacher_probs)
             
             if batch_idx == 0 and epoch == 0:
                 print(f"\nLoss computation:")
                 print(f"  CE loss: {ce_loss.item():.4f}")
                 print(f"  KD loss: {kd_loss.item():.4f}")
-                print(f"  Valid tokens: {num_valid_tokens.item()}")
                 print(f"  Temperature: {args.temperature}")
                 print(f"  Temperature^2: {args.temperature ** 2}")
 
             
             # Combined loss
-            loss = args.alpha_ce * ce_loss + args.alpha_kd * (args.temperature ** 2) * kd_loss
+            loss = args.alpha_ce * ce_loss + args.alpha_kd  * kd_loss
             
             # Backward pass
             optimizer.zero_grad()
@@ -426,6 +423,22 @@ def main():
             total_loss += loss.item()
             total_ce_loss += ce_loss.item()
             total_kd_loss += kd_loss.item()
+            
+            # Get current learning rate
+            current_lr = scheduler.get_last_lr()[0] if scheduler is not None else args.learning_rate
+            
+            # Log to CSV
+            with open(log_file, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    epoch + 1,
+                    batch_idx + 1,
+                    loss.item(),
+                    ce_loss.item(),
+                    kd_loss.item(),
+                    current_lr
+                ])
             
             # Update progress bar
             postfix = {
@@ -524,7 +537,33 @@ def main():
             print("This is expected if generate() method needs adjustment")
     
     print("\n Training completed successfully!")
+    print(f"Training logs saved to: {log_file}")
 
 
 if __name__ == '__main__':
     main()
+    
+    
+    
+    
+### IN production 
+
+
+""" python train_distill.py \
+  --teacher_model Qwen/Qwen2.5-0.5B \
+  --n_embed 512 \
+  --n_head 8 \
+  --n_layer 6 \
+  --num_experts 8 \
+  --num_experts_per_tok 2 \
+  --batch_size 4 \
+  --num_epochs 3 \
+  --learning_rate 1e-4 \
+  --max_samples 10000 \
+  --max_length 256 \
+  --output_dir checkpoints \
+  --log_file training_logs.csv \
+  --device cuda """
+  
+  
+  
