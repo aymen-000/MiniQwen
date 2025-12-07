@@ -2,13 +2,13 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from datasets import load_dataset
 from tqdm import tqdm
 import os
 import argparse
 import csv
 from datetime import datetime
 from DistillMiniQwen.model import Qwen3MoE, Qwen3Config
+from DistillMiniQwen.data import TextDataset, collate_fn
 
 
 def parse_args():
@@ -34,7 +34,7 @@ def parse_args():
     parser.add_argument('--rms_norm_eps', type=float, default=1e-6,
                         help='RMSNorm epsilon')
     parser.add_argument('--tie_word_embeddings', action='store_true',
-                        help='Tie input/output embeddings' , default=True)
+                        help='Tie input/output embeddings', default=True)
     parser.add_argument('--head_dim', type=int, default=None,
                         help='Head dimension (optional)')
     
@@ -46,17 +46,10 @@ def parse_args():
     parser.add_argument('--moe_intermediate_size', type=int, default=1024,
                         help='MoE intermediate size')
     
-    # Dataset
-    parser.add_argument('--dataset', type=str, default='jtatman/python-code-dataset-500k',
-                        help='Dataset name from HuggingFace')
-    parser.add_argument('--dataset_split', type=str, default='train',
-                        help='Dataset split to use')
-    parser.add_argument('--instruction_column', type=str, default='instruction',
-                        help='Column name for instructions')
-    parser.add_argument('--output_column', type=str, default='output',
-                        help='Column name for outputs')
-    parser.add_argument('--max_samples', type=int, default=10000,
-                        help='Maximum number of samples to use')
+    # Dataset - MODIFIED to use local JSONL file
+    parser.add_argument('--train_data', type=str, 
+                        default='data/general_instruction_merged.jsonl',
+                        help='Path to training data JSONL file')
     parser.add_argument('--max_length', type=int, default=256,
                         help='Maximum sequence length')
     
@@ -92,7 +85,7 @@ def parse_args():
     # Checkpointing
     parser.add_argument('--output_dir', type=str, default='checkpoints',
                         help='Output directory for checkpoints')
-    parser.add_argument('--save_interval', type=int, default=100,
+    parser.add_argument('--save_interval', type=int, default=500,
                         help='Save checkpoint every N steps')
     parser.add_argument('--best_model_name', type=str, default='qwen3_moe_distilled_best.pt',
                         help='Best model checkpoint name')
@@ -100,8 +93,10 @@ def parse_args():
                         help='Final model checkpoint name')
     
     # Logging
-    parser.add_argument('--log_file', type=str, default='training_logs.csv',
+    parser.add_argument('--log_file', type=str, default='distillation_logs.csv',
                         help='CSV file to save training logs')
+    parser.add_argument('--log_interval', type=int, default=10,
+                        help='Log to CSV every N steps')
     
     # Testing
     parser.add_argument('--test_prompt', type=str, 
@@ -153,7 +148,8 @@ def main():
     # Load teacher model
     print(f"Loading teacher model: {args.teacher_model}")
     teacher_tokenizer = AutoTokenizer.from_pretrained(args.teacher_model, trust_remote_code=True)
-    print(f"teacher tokenizer {len(teacher_tokenizer)} ")
+    print(f"Teacher tokenizer vocab size: {len(teacher_tokenizer)}")
+    
     teacher_kwargs = {'trust_remote_code': True}
     if args.fp16_teacher and device == 'cuda':
         teacher_kwargs['torch_dtype'] = torch.float16
@@ -167,6 +163,7 @@ def main():
     # Add pad token if not present
     if teacher_tokenizer.pad_token is None:
         teacher_tokenizer.pad_token = teacher_tokenizer.eos_token
+    
     # Student config
     config = Qwen3Config(
         n_embed=args.n_embed,
@@ -217,11 +214,18 @@ def main():
         betas=(0.9, 0.95)
     )
     
+    # Calculate total steps for scheduler
+    # We need to estimate this based on dataset size
+    print(f"\nLoading dataset from: {args.train_data}")
+    temp_dataset = TextDataset(args.train_data, teacher_tokenizer, args.max_length)
+    total_steps = (len(temp_dataset) // args.batch_size) * args.num_epochs
+    print(f"Estimated total training steps: {total_steps}")
+    
     # Scheduler
     if args.scheduler_type == 'cosine':
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=args.scheduler_t_max,
+            T_max=total_steps,
             eta_min=args.scheduler_eta_min
         )
     elif args.scheduler_type == 'linear':
@@ -229,62 +233,42 @@ def main():
             optimizer,
             start_factor=1.0,
             end_factor=0.1,
-            total_iters=args.scheduler_t_max
+            total_iters=total_steps
         )
     else:
         scheduler = None
     
     # ===========================
-    # 2. DATASET
+    # 2. DATASET - MODIFIED TO USE TextDataset
     # ===========================
-    print(f"Loading dataset: {args.dataset}")
-    dataset = load_dataset(args.dataset, split=args.dataset_split)
+    print(f"\nCreating dataset from merged JSONL file...")
+    dataset = TextDataset(args.train_data, teacher_tokenizer, args.max_length)
+    print(f"Dataset loaded: {len(dataset)} token chunks")
     
-    # Take subset
-    dataset = dataset.select(range(min(args.max_samples, len(dataset))))
-    print(f"Using {len(dataset)} samples")
-    
-    def preprocess(example):
-        """Preprocess examples for distillation"""
-        prompt = example.get(args.instruction_column, "")
-        target = example.get(args.output_column, "")
-        
-        # Format the text
-        text = f"Instruction: {prompt}\nAnswer: {target}"
-        
-        # Tokenize
-        tokens = teacher_tokenizer(
-            text,
-            truncation=True,
-            padding="max_length",
-            max_length=args.max_length,
-            return_tensors="pt"
-        )
-        
-        return {
-            "input_ids": tokens["input_ids"].squeeze(0),
-            "attention_mask": tokens["attention_mask"].squeeze(0),
-        }
-    
-    print("Preprocessing dataset...")
-    dataset = dataset.map(preprocess, remove_columns=dataset.column_names)
-    dataset.set_format(type="torch", columns=["input_ids", "attention_mask"])
-    
-    # Create dataloader
+    # Create dataloader with custom collate_fn
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers
+        num_workers=args.num_workers,
+        collate_fn=collate_fn,
+        pin_memory=True if device == 'cuda' else False
     )
+    
+    print(f"DataLoader created: {len(loader)} batches per epoch")
     
     # Validate dataset
     print("\nValidating dataset...")
     test_batch = next(iter(loader))
-    test_ids = test_batch["input_ids"]
-    max_id = test_ids.max().item()
-    min_id = test_ids.min().item()
-    print(f"Token ID range: [{min_id}, {max_id}]")
+    input_ids, labels = test_batch
+    input_ids = input_ids.to(device)
+    labels = labels.to(device)
+    
+    max_id = input_ids.max().item()
+    min_id = input_ids.min().item()
+    print(f"Input token ID range: [{min_id}, {max_id}]")
+    print(f"Input shape: {input_ids.shape}")
+    print(f"Labels shape: {labels.shape}")
     print(f"Tokenizer vocab size: {len(teacher_tokenizer)}")
     
     if max_id >= len(teacher_tokenizer):
@@ -304,9 +288,11 @@ def main():
     print("Starting distillation training...")
     print(f"Total steps per epoch: {len(loader)}")
     print(f"Total epochs: {args.num_epochs}")
+    print(f"Total training steps: {len(loader) * args.num_epochs}")
     print("="*50 + "\n")
     
     best_loss = float('inf')
+    global_step = 0
     
     for epoch in range(args.num_epochs):
         student_model.train()
@@ -317,8 +303,10 @@ def main():
         progress_bar = tqdm(loader, desc=f"Epoch {epoch+1}/{args.num_epochs}")
         
         for batch_idx, batch in enumerate(progress_bar):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
+            # Unpack batch from TextDataset
+            input_ids, labels = batch
+            input_ids = input_ids.to(device)
+            labels = labels.to(device)
             
             # Verify input_ids are valid
             if input_ids.max() >= len(teacher_tokenizer):
@@ -326,25 +314,10 @@ def main():
                 print(f"Valid range is [0, {len(teacher_tokenizer)-1}]")
                 continue
             
-            # Create labels (shift input_ids by 1 for causal LM)
-            labels = input_ids.clone()
-            labels[:, :-1] = input_ids[:, 1:]
-            labels[:, -1] = teacher_tokenizer.pad_token_id
-            
-            # Mask padding tokens in labels
-            labels[labels == teacher_tokenizer.pad_token_id] = -100
-            
-            # Additional safety: ensure no labels are out of bounds
-            valid_mask = (labels >= 0) & (labels < len(teacher_tokenizer))
-            labels[~valid_mask & (labels != -100)] = -100
-            
             # Get teacher predictions (no gradient)
             with torch.no_grad():
-                teacher_outputs = teacher_model(
-                    input_ids,
-                    attention_mask=attention_mask
-                )
-                teacher_logits = teacher_outputs.logits[: , : , :len(teacher_tokenizer)]  # (B, T, vocab_size)
+                teacher_outputs = teacher_model(input_ids)
+                teacher_logits = teacher_outputs.logits[:, :, :len(teacher_tokenizer)]
                 
                 # Debug: Check teacher output shape on first batch
                 if batch_idx == 0 and epoch == 0:
@@ -357,7 +330,7 @@ def main():
             
             # Get student predictions
             try:
-                student_logits = student_model(input_ids)  # (B, T, vocab_size)
+                student_logits = student_model(input_ids)
                 
                 # Debug: Check shapes on first batch
                 if batch_idx == 0 and epoch == 0:
@@ -373,7 +346,7 @@ def main():
             
             # Apply temperature to student logits
             student_logits_temp = student_logits / args.temperature
-            student_log_probs = torch.log_softmax(student_logits_temp, dim=-1)  # (B, T, vocab_size)
+            student_log_probs = torch.log_softmax(student_logits_temp, dim=-1)
             
             # Verify shapes match
             if batch_idx == 0 and epoch == 0:
@@ -382,19 +355,18 @@ def main():
                 print(f"  teacher_probs: {teacher_probs.shape}")
                 print(f"  Flattened student logits: {student_logits.view(-1, student_logits.size(-1)).shape}")
                 print(f"  Flattened labels: {labels.view(-1).shape}")
+            
             # Verify shapes are compatible
             assert student_logits.shape == teacher_logits.shape, \
                 f"Shape mismatch: student {student_logits.shape} vs teacher {teacher_logits.shape}"
             
             # Cross entropy loss (student vs. ground truth)
             ce_loss = ce_loss_fn(
-                student_logits.view(-1, student_logits.size(-1)),  # (B*T, vocab_size)
-                labels.view(-1)    # (B*T,vocab_size)
+                student_logits.view(-1, student_logits.size(-1)),
+                labels.view(-1)
             )
             
-
-            
-            # Compute KL divergence 
+            # Compute KL divergence
             kd_loss = kl_loss_fn(student_log_probs, teacher_probs)
             
             if batch_idx == 0 and epoch == 0:
@@ -402,11 +374,9 @@ def main():
                 print(f"  CE loss: {ce_loss.item():.4f}")
                 print(f"  KD loss: {kd_loss.item():.4f}")
                 print(f"  Temperature: {args.temperature}")
-                print(f"  Temperature^2: {args.temperature ** 2}")
-
             
             # Combined loss
-            loss = args.alpha_ce * ce_loss + args.alpha_kd  * kd_loss
+            loss = args.alpha_ce * ce_loss + args.alpha_kd * kd_loss
             
             # Backward pass
             optimizer.zero_grad()
@@ -423,22 +393,25 @@ def main():
             total_loss += loss.item()
             total_ce_loss += ce_loss.item()
             total_kd_loss += kd_loss.item()
+            global_step += 1
             
             # Get current learning rate
             current_lr = scheduler.get_last_lr()[0] if scheduler is not None else args.learning_rate
             
-            # Log to CSV
-            with open(log_file, 'a', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    epoch + 1,
-                    batch_idx + 1,
-                    loss.item(),
-                    ce_loss.item(),
-                    kd_loss.item(),
-                    current_lr
-                ])
+            # Log to CSV every N steps
+            if global_step % args.log_interval == 0:
+                with open(log_file, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        epoch + 1,
+                        global_step,
+                        loss.item(),
+                        ce_loss.item(),
+                        kd_loss.item(),
+                        current_lr
+                    ])
+            
             
             # Update progress bar
             postfix = {
@@ -447,30 +420,8 @@ def main():
                 'kd': f'{kd_loss.item():.4f}',
             }
             if scheduler is not None:
-                postfix['lr'] = f'{scheduler.get_last_lr()[0]:.2e}'
+                postfix['lr'] = f'{current_lr:.2e}'
             progress_bar.set_postfix(postfix)
-            
-            # Save checkpoint
-            if (batch_idx + 1) % args.save_interval == 0:
-                checkpoint_path = os.path.join(
-                    args.output_dir,
-                    f"checkpoint_epoch{epoch+1}_step{batch_idx+1}.pt"
-                )
-                os.makedirs(args.output_dir, exist_ok=True)
-                
-                checkpoint = {
-                    'epoch': epoch,
-                    'step': batch_idx,
-                    'model_state_dict': student_model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'loss': loss.item(),
-                    'config': config.__dict__,
-                }
-                if scheduler is not None:
-                    checkpoint['scheduler_state_dict'] = scheduler.state_dict()
-                
-                torch.save(checkpoint, checkpoint_path)
-                print(f"\n Checkpoint saved to {checkpoint_path}")
         
         # Epoch summary
         avg_loss = total_loss / len(loader)
@@ -484,23 +435,6 @@ def main():
         print(f"  Average KD Loss: {avg_kd:.4f}")
         print(f"{'='*50}\n")
         
-        # Save best model
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            best_model_path = args.best_model_name
-            
-            checkpoint = {
-                'epoch': epoch,
-                'model_state_dict': student_model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': avg_loss,
-                'config': config.__dict__,
-            }
-            if scheduler is not None:
-                checkpoint['scheduler_state_dict'] = scheduler.state_dict()
-            
-            torch.save(checkpoint, best_model_path)
-            print(f" Best model saved to {best_model_path}")
     
     # ===========================
     # 4. SAVE FINAL MODEL
@@ -510,7 +444,7 @@ def main():
         'model_state_dict': student_model.state_dict(),
         'config': config.__dict__,
     }, final_model_path)
-    print(f"\n Final distilled model saved to {final_model_path}")
+    print(f"\nFinal distilled model saved to {final_model_path}")
     
     # ===========================
     # 5. TEST GENERATION
@@ -542,28 +476,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-    
-    
-    
-    
-### IN production 
-
-
-""" python train_distill.py \
-  --teacher_model Qwen/Qwen2.5-0.5B \
-  --n_embed 512 \
-  --n_head 8 \
-  --n_layer 6 \
-  --num_experts 8 \
-  --num_experts_per_tok 2 \
-  --batch_size 4 \
-  --num_epochs 3 \
-  --learning_rate 1e-4 \
-  --max_samples 10000 \
-  --max_length 256 \
-  --output_dir checkpoints \
-  --log_file training_logs.csv \
-  --device cuda """
-  
-  
-  

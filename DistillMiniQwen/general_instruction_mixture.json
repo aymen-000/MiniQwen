@@ -1,0 +1,29 @@
+{
+    "datasets": [
+      {
+        "name": "openorca",
+        "path": "Open-Orca/OpenOrca",
+        "weight": 0.40
+      },
+      {
+        "name": "oasst1",
+        "path": "OpenAssistant/oasst1",
+        "weight": 0.20
+      },
+      {
+        "name": "flan",
+        "path": "conceptofmind/FLAN_2022",
+        "weight": 0.20
+      },
+      {
+        "name": "dolly",
+        "path": "databricks/databricks-dolly-15k",
+        "weight": 0.10
+      },
+      {
+        "name": "sharegpt",
+        "path": "anon8231489123/ShareGPT_Vicuna_unfiltered",
+        "weight": 0.10
+      }
+    ]
+  }
