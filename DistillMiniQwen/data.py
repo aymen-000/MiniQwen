@@ -8,109 +8,57 @@ from tqdm import tqdm
 
 
 # ============================================================
-# 1) Load dataset mixture config
+# 1) Load Ubuntu Dialogue QA dataset (REAL DATA)
 # ============================================================
 
-CONFIG_PATH = "./DistillMiniQwen/general_instruction_mixture.json"  
 OUTPUT_DIR = "data"
-MERGED_FILE = os.path.join(OUTPUT_DIR, "general_instruction_merged.jsonl")
+MERGED_FILE = os.path.join(OUTPUT_DIR, "ubuntu_dialogue_qa.jsonl")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-with open(CONFIG_PATH, "r") as f:
-    mix_cfg = json.load(f)
+print("\nLoading dataset: sedthh/ubuntu_dialogue_qa")
 
-datasets_cfg = mix_cfg["datasets"]
-
-TOTAL_SAMPLES = 24000   # final dataset size — small & perfect for KD
-
-# assign samples by weight
-for ds in datasets_cfg:
-    ds["samples"] = int(TOTAL_SAMPLES * ds["weight"])
+ds = load_dataset(
+    "sedthh/ubuntu_dialogue_qa",
+    split="train",
+    verification_mode="no_checks"
+)
 
 
-print("\n========= DOWNLOAD PLAN =========")
-for ds in datasets_cfg:
-    print(f"{ds['name']} : {ds['samples']} samples")
-print("=================================\n")
+print(f"Using {len(ds)} samples")
 
 
 # ============================================================
-# 2) Download + merge all datasets in one JSONL file
+# 2) Convert to instruction format and save JSONL
 # ============================================================
 
-def load_first_n(dataset_path, n):
-    """
-    Loads the first N rows of an HF dataset safely.
-    """
-    try:
-        # Try streaming first for large datasets
-        ds = load_dataset(dataset_path, split="train", streaming=True)
-        samples = []
-        for i, sample in enumerate(ds):
-            if i >= n:
-                break
-            samples.append(sample)
-        return samples
-    except:
-        try:
-            # Fall back to direct split indexing
-            return load_dataset(dataset_path, split=f"train[:{n}]")
-        except:
-            # Last resort: load full dataset and select
-            ds = load_dataset(dataset_path, split="train")
-            return ds.select(range(min(n, len(ds))))
+print("\nFormatting and saving dataset...")
 
+with open(MERGED_FILE, "w", encoding="utf-8") as f:
+    count = 0
+    for row in tqdm(ds):
 
-print("Starting download and merge...")
+        question = row.get("INSTRUCTION", "").strip()
+        answer = row.get("RESPONSE", "").strip()
 
-with open(MERGED_FILE, "w", encoding="utf-8") as f_out:
-
-    for ds in datasets_cfg:
-        name = ds["name"]
-        path = ds["path"]
-        n = ds["samples"]
-
-        print(f"\nDownloading {name} ({path}) with {n} samples...")
-
-        try:
-            split = load_first_n(path, n)
-
-            count = 0
-            for row in split:
-                # Handle different dataset formats
-                if "text" in row:
-                    text = row["text"]
-                elif "instruction" in row and "response" in row:
-                    text = f"{row['instruction']}\n{row['response']}"
-                elif "instruction" in row and "output" in row:
-                    text = f"{row['instruction']}\n{row['output']}"
-                elif "prompt" in row and "completion" in row:
-                    text = f"{row['prompt']}\n{row['completion']}"
-                elif "question" in row and "answer" in row:
-                    text = f"{row['question']}\n{row['answer']}"
-                elif "conversations" in row:
-                    # Handle ShareGPT format
-                    convs = row["conversations"]
-                    text = "\n".join([f"{c.get('from', '')}: {c.get('value', '')}" for c in convs])
-                else:
-                    text = " ".join([str(v) for v in row.values()])
-
-                if text.strip():
-                    f_out.write(json.dumps({"text": text.strip()}) + "\n")
-                    count += 1
-
-            print(f"✔ Saved {count} samples from {name}")
-            
-        except Exception as e:
-            print(f"⚠ ERROR loading {name}: {e}")
+        if not question or not answer:
             continue
 
-print("\nDONE — merged dataset saved at:", MERGED_FILE)
+        text = (
+            "### Instruction:\n"
+            f"{question}\n\n"
+            "### Response:\n"
+            f"{answer}"
+        )
+
+        f.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
+        count += 1
+
+print(f"✔ Saved {count} samples to {MERGED_FILE}")
 
 
 # ============================================================
-# 3) TextDataset class for autoregressive LM
+# 3) TextDataset class (autoregressive LM)
 # ============================================================
 
 class TextDataset(Dataset):
@@ -131,13 +79,13 @@ class TextDataset(Dataset):
             if not text.strip():
                 continue
 
-            tokens = tokenizer.encode(text.strip(), add_special_tokens=True)
+            tokens = tokenizer.encode(text, add_special_tokens=True)
 
             # chunk into max_length pieces
             for i in range(0, len(tokens), max_length):
-                chunk = tokens[i:i+max_length]
+                chunk = tokens[i:i + max_length]
                 if len(chunk) > 2:
-                    self.examples.append(torch.tensor(chunk))
+                    self.examples.append(torch.tensor(chunk, dtype=torch.long))
 
         print(f"Final dataset token chunks: {len(self.examples)}")
 
@@ -165,6 +113,7 @@ def collate_fn(batch):
         if pad_len > 0:
             x = F.pad(x, (0, pad_len), value=0)
             y = F.pad(y, (0, pad_len), value=-100)
+
         padded_inp.append(x)
         padded_tgt.append(y)
 
@@ -175,16 +124,20 @@ def collate_fn(batch):
 # 5) HOW TO USE
 # ============================================================
 
-# Example (uncomment after you load your tokenizer):
-#
-# from transformers import AutoTokenizer
-# tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-1.5B")
-#
-# dataset = TextDataset(MERGED_FILE, tokenizer)
-#
-# loader = DataLoader(dataset, batch_size=4, shuffle=True, collate_fn=collate_fn)
-#
-# for batch in loader:
-#     input_ids, labels = batch
-#     print(input_ids.shape, labels.shape)
-#     break
+"""
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-1.5B", use_fast=True)
+
+dataset = TextDataset(MERGED_FILE, tokenizer)
+loader = DataLoader(
+    dataset,
+    batch_size=4,
+    shuffle=True,
+    collate_fn=collate_fn
+)
+
+for input_ids, labels in loader:
+    print(input_ids.shape, labels.shape)
+    break
+"""
